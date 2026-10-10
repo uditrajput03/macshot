@@ -158,15 +158,14 @@ enum RecordingSampleValidation {
 /// bound: ScreenCaptureKit's non-interleaved buffers can report sizes that say
 /// nothing about how much audio is actually waiting.
 struct RecordingAudioQueue: @unchecked Sendable {
-    // CoreMedia has not annotated CMSampleBuffer as Sendable. Ownership of
     // this value stays on MP4WriterSession.queue; retained buffers are read-only.
-    nonisolated(unsafe) private var storage: [CMSampleBuffer] = []
+    private var storage: [CMSampleBuffer] = []
     private var head = 0
     private(set) var bufferedSeconds: Double = 0
     let maximumSeconds: Double
     let maximumBuffers: Int
 
-    nonisolated init(maximumSeconds: Double = 10, maximumBuffers: Int = 4096) {
+    nonisolated init(maximumSeconds: Double = 30, maximumBuffers: Int = 8192) {
         self.maximumSeconds = maximumSeconds
         self.maximumBuffers = maximumBuffers
     }
