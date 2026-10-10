@@ -13,6 +13,9 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: macos-26
@@ -122,9 +125,48 @@ jobs:
             -scheme macshot \
             -configuration Release \
             -destination 'platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             | { grep -E "error:|\*\* BUILD" || true; }
           exit ${PIPESTATUS[0]}
+
+      - name: Package and Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APP="build/Build/Products/Release/macshot.app"
+          if [ -d "$APP" ]; then
+            echo "Signing app binaries (ad-hoc)..."
+            find "$APP/Contents" -name "*.dylib" -exec codesign --force --sign - {} + || true
+            find "$APP/Contents/Frameworks" -name "*.framework" -exec codesign --force --sign - {} + || true
+            codesign --force --deep --sign - --entitlements macshot/macshot.entitlements "$APP" || true
+            ditto -c -k --keepParent "$APP" MacShot.zip
+            hdiutil create -volname "macshot" -srcfolder "$APP" -ov -format UDZO MacShot.dmg || true
+
+            TAG="v4.4.0-test"
+            echo "Test build containing fixes for internal audio recording (#455) and timescale export (#448, #449)." > release_notes.md
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" MacShot.dmg MacShot.zip --clobber || true
+            else
+              gh release create "$TAG" MacShot.dmg MacShot.zip \
+                --target "${{ github.ref_name }}" \
+                --title "Test Build (Internal Audio Fixes)" \
+                --notes-file release_notes.md \
+                --prerelease || true
+            fi
+          fi
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: MacShot-Test-Build
+          path: |
+            MacShot.dmg
+            MacShot.zip
+          retention-days: 7
 
       - name: Build Release (offline variant)
         run: |
