@@ -634,7 +634,7 @@ final class RecordingWriterTests: XCTestCase {
             let pts = CMTime(value: Int64(4_800_000 + tick * 960 - (tick > 0 ? 2 : 0)), timescale: 48_000)
             let mic = try RecordingMediaFixture.audio(samples: 960, pts: pts, phaseSample: tick * 960)
             queue.sync { writer.handleMicSample(mic) }
-            if tick % 5 == 0 {
+            if tick > 0, tick % 5 == 0 {
                 try await append(writer, time: 100 + Double(tick) * 0.02, buffer: pixels)
             }
         }
