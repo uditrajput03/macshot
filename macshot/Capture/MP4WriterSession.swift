@@ -286,7 +286,6 @@ final class MP4WriterSession: @unchecked Sendable {
             var done = false
             input.requestMediaDataWhenReady(on: queue) { [weak self] in
                 guard let self = self, !done, self.finalResult == nil else { return }
-                self.synchronizeAudioTracks()
                 self.drainAudio(isMic: isMic)
                 let empty = isMic ? self.pendingMicSamples.isEmpty : self.pendingAudioSamples.isEmpty
                 guard empty || self.firstError != nil else {
@@ -505,7 +504,9 @@ final class MP4WriterSession: @unchecked Sendable {
     }
 
     private func drainAudio(isMic: Bool) {
-        synchronizeAudioTracks()
+        if !isMic {
+            synchronizeAudioTracks()
+        }
         guard sessionStarted, firstError == nil,
               let input = isMic ? micAudioInput : audioInput else { return }
         while input.isReadyForMoreMediaData {
@@ -513,6 +514,25 @@ final class MP4WriterSession: @unchecked Sendable {
             guard let sample = sample else { break }
             let lastEnd = isMic ? lastMicEnd : lastAudioEnd
             let boundary = lastEnd.isNumeric ? CMTimeMaximum(startTime, lastEnd) : startTime
+
+            // If system audio had a gap before this sample, fill the gap with silence
+            // so the system audio track remains contiguous and aligned with the timeline.
+            if !isMic, boundary.isNumeric {
+                let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                if CMTimeCompare(pts, boundary) > 0 {
+                    let gap = CMTimeSubtract(pts, boundary)
+                    if gap.seconds > 0.05,
+                       let format = activeSystemAudioFormat(),
+                       let silence = makeSilentBuffer(matching: format, duration: gap, at: boundary) {
+                        if !input.append(silence) {
+                            fail(assetWriter?.error ?? WriterError.appendFailed)
+                            return
+                        }
+                        lastAudioEnd = pts
+                    }
+                }
+            }
+
             guard let clipped = alignedAudio(sample, startingAt: boundary, isMic: isMic) else { continue }
             guard input.append(clipped) else {
                 fail(assetWriter?.error ?? WriterError.appendFailed); return
@@ -526,46 +546,33 @@ final class MP4WriterSession: @unchecked Sendable {
         guard sessionStarted, firstError == nil else { return }
 
         // Inter-track interleaving synchronization:
-        // AVAssetWriter will stall all other tracks if any audio track lags by ~0.5s or more.
+        // AVAssetWriter will stall all other tracks if any audio track lags by ~1.0s or more.
         // ScreenCaptureKit stops sending system audio buffers during silence, starving audioInput
-        // and causing micAudioInput to refuse buffers until queues overflow and abort the recording.
-        // We synthesize silence for any starving track so both tracks advance smoothly together.
-        if let audioInput = self.audioInput, let micAudioInput = self.micAudioInput {
-            // Case 1: System audio is lagging behind microphone
-            if lastMicEnd.isNumeric, lastAudioEnd.isNumeric,
-               CMTimeCompare(lastMicEnd, lastAudioEnd) > 0 {
-                var gap = CMTimeSubtract(lastMicEnd, lastAudioEnd).seconds
-                while gap > 0.1, pendingAudioSamples.isEmpty, audioInput.isReadyForMoreMediaData {
-                    let chunk = CMTime(seconds: min(gap, 1.0), preferredTimescale: 48_000)
-                    guard let format = activeSystemAudioFormat(),
-                          let silence = makeSilentBuffer(matching: format, duration: chunk, at: lastAudioEnd) else {
-                        break
+        // and causing micAudioInput to refuse buffers until queues overflow.
+        // We synthesize silence ONLY for system audio when it is significantly lagging behind the microphone
+        // (with a 0.5s safe headroom so real in-flight system audio buffers are never clipped or dropped).
+        // Microphone audio is NEVER synthesized as silence because microphone is a live hardware stream.
+        if let audioInput = self.audioInput, self.micAudioInput != nil {
+            if lastMicEnd.isNumeric, lastAudioEnd.isNumeric {
+                let lead = CMTimeSubtract(lastMicEnd, lastAudioEnd).seconds
+                if lead > 1.0, pendingAudioSamples.isEmpty, audioInput.isReadyForMoreMediaData {
+                    let safeTarget = CMTimeSubtract(lastMicEnd, CMTime(seconds: 0.5, preferredTimescale: 48_000))
+                    while CMTimeCompare(lastAudioEnd, safeTarget) < 0,
+                          pendingAudioSamples.isEmpty,
+                          audioInput.isReadyForMoreMediaData {
+                        let remaining = CMTimeSubtract(safeTarget, lastAudioEnd)
+                        let chunk = CMTime(seconds: min(remaining.seconds, 1.0), preferredTimescale: 48_000)
+                        guard chunk.seconds > 0.01,
+                              let format = activeSystemAudioFormat(),
+                              let silence = makeSilentBuffer(matching: format, duration: chunk, at: lastAudioEnd) else {
+                            break
+                        }
+                        guard audioInput.append(silence) else {
+                            fail(assetWriter?.error ?? WriterError.appendFailed)
+                            return
+                        }
+                        lastAudioEnd = CMTimeAdd(lastAudioEnd, chunk)
                     }
-                    guard audioInput.append(silence) else {
-                        fail(assetWriter?.error ?? WriterError.appendFailed)
-                        return
-                    }
-                    lastAudioEnd = CMTimeAdd(lastAudioEnd, chunk)
-                    gap = CMTimeSubtract(lastMicEnd, lastAudioEnd).seconds
-                }
-            }
-
-            // Case 2: Microphone is lagging behind system audio
-            if lastAudioEnd.isNumeric, lastMicEnd.isNumeric,
-               CMTimeCompare(lastAudioEnd, lastMicEnd) > 0 {
-                var gap = CMTimeSubtract(lastAudioEnd, lastMicEnd).seconds
-                while gap > 0.1, pendingMicSamples.isEmpty, micAudioInput.isReadyForMoreMediaData {
-                    let chunk = CMTime(seconds: min(gap, 1.0), preferredTimescale: 48_000)
-                    guard let format = activeMicAudioFormat(),
-                          let silence = makeSilentBuffer(matching: format, duration: chunk, at: lastMicEnd) else {
-                        break
-                    }
-                    guard micAudioInput.append(silence) else {
-                        fail(assetWriter?.error ?? WriterError.appendFailed)
-                        return
-                    }
-                    lastMicEnd = CMTimeAdd(lastMicEnd, chunk)
-                    gap = CMTimeSubtract(lastAudioEnd, lastMicEnd).seconds
                 }
             }
         }
@@ -652,37 +659,6 @@ final class MP4WriterSession: @unchecked Sendable {
         )
         if status == noErr, let format = format {
             self.systemAudioFormat = format
-            return format
-        }
-        return nil
-    }
-
-    private func activeMicAudioFormat() -> CMAudioFormatDescription? {
-        if let microphoneFormat = microphoneFormat { return microphoneFormat }
-        var asbd = AudioStreamBasicDescription(
-            mSampleRate: 48_000,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: 4,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 4,
-            mChannelsPerFrame: 1,
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
-        var format: CMAudioFormatDescription?
-        let status = CMAudioFormatDescriptionCreate(
-            allocator: kCFAllocatorDefault,
-            asbd: &asbd,
-            layoutSize: 0,
-            layout: nil,
-            magicCookieSize: 0,
-            magicCookie: nil,
-            extensions: nil,
-            formatDescriptionOut: &format
-        )
-        if status == noErr, let format = format {
-            self.microphoneFormat = format
             return format
         }
         return nil

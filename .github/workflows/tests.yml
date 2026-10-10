@@ -151,7 +151,7 @@ jobs:
               gh release upload "$TAG" MacShot.dmg MacShot.zip --clobber || true
             else
               gh release create "$TAG" MacShot.dmg MacShot.zip \
-                --target "${{ github.ref_name }}" \
+                --target "${{ github.sha }}" \
                 --title "Test Build (Internal Audio Fixes)" \
                 --notes-file release_notes.md \
                 --prerelease || true
