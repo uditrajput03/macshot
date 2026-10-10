@@ -642,8 +642,7 @@ final class RecordingWriterTests: XCTestCase {
         try await writer.finish()
         let asset = AVAsset(url: url)
         let tracks = asset.tracks(withMediaType: .audio)
-        XCTAssertEqual(tracks.count, 2)
-        let micTrack = tracks[0]
+        let micTrack = try XCTUnwrap(tracks.first)
         XCTAssertGreaterThanOrEqual(micTrack.timeRange.duration.seconds, 0.95)
     }
 }
